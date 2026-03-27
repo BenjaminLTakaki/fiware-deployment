@@ -13,7 +13,7 @@ Automated deployment script for the FIWARE Data Space Connector, optimized for r
 ## Requirements
 
 - Ubuntu 24.04 LTS
-- Minimum 8 vCores, 24GB RAM, 100GB disk
+- Minimum 8 vCores, 32GB RAM, 100GB disk
 - Internet access
 
 ## Quick Start
