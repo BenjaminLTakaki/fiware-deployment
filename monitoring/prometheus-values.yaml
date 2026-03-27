@@ -1,0 +1,243 @@
+# ============================================================================
+# Prometheus Stack Configuration for FIWARE Research Deployment
+# ============================================================================
+# This configuration deploys kube-prometheus-stack with settings optimized
+# for research and monitoring of FIWARE Data Space Connector components.
+#
+# Deploy with:
+#   helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
+#     --namespace monitoring --create-namespace \
+#     -f prometheus-values.yaml
+# ============================================================================
+
+# Global settings
+fullnameOverride: fiware-prometheus
+
+# Prometheus configuration
+prometheus:
+  prometheusSpec:
+    # Retention for research data collection
+    retention: 30d
+    retentionSize: 10GB
+
+    # Resource limits for research VM
+    resources:
+      requests:
+        memory: 1Gi
+        cpu: 500m
+      limits:
+        memory: 2Gi
+        cpu: 1000m
+
+    # Storage configuration
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: local-path
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 20Gi
+
+    # Scrape all namespaces
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+
+    # Additional scrape configs for FIWARE components
+    additionalScrapeConfigs:
+      # Keycloak metrics
+      - job_name: 'keycloak-provider'
+        static_configs:
+          - targets: ['keycloak-provider.provider.svc.cluster.local:8080']
+        metrics_path: /metrics
+        scheme: http
+
+      - job_name: 'keycloak-consumer'
+        static_configs:
+          - targets: ['keycloak-consumer.consumer.svc.cluster.local:8080']
+        metrics_path: /metrics
+        scheme: http
+
+      # Scorpio Broker metrics
+      - job_name: 'scorpio-broker'
+        static_configs:
+          - targets: ['scorpio-broker.provider.svc.cluster.local:9090']
+        metrics_path: /q/metrics
+        scheme: http
+
+      # APISIX metrics
+      - job_name: 'apisix-provider'
+        static_configs:
+          - targets: ['provider-apisix-data-plane.provider.svc.cluster.local:9091']
+        metrics_path: /apisix/prometheus/metrics
+        scheme: http
+
+      - job_name: 'apisix-consumer'
+        static_configs:
+          - targets: ['consumer-apisix-data-plane.consumer.svc.cluster.local:9091']
+        metrics_path: /apisix/prometheus/metrics
+        scheme: http
+
+# Grafana configuration
+grafana:
+  enabled: true
+
+  adminPassword: fiware-research-2024
+
+  # Persistence for dashboards
+  persistence:
+    enabled: true
+    storageClassName: local-path
+    size: 5Gi
+
+  # Resource limits
+  resources:
+    requests:
+      memory: 256Mi
+      cpu: 100m
+    limits:
+      memory: 512Mi
+      cpu: 500m
+
+  # Ingress for external access
+  ingress:
+    enabled: true
+    ingressClassName: traefik
+    hosts:
+      - grafana.{{ .Values.global.domain | default "127.0.0.1.nip.io" }}
+
+  # Default dashboards
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: 'fiware'
+          orgId: 1
+          folder: 'FIWARE'
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards/fiware
+
+  # Dashboard definitions
+  dashboards:
+    fiware:
+      fiware-overview:
+        json: |
+          {
+            "title": "FIWARE Data Space Connector Overview",
+            "uid": "fiware-overview",
+            "tags": ["fiware", "research"],
+            "timezone": "browser",
+            "schemaVersion": 30,
+            "panels": [
+              {
+                "title": "Active Pods by Namespace",
+                "type": "stat",
+                "gridPos": {"x": 0, "y": 0, "w": 6, "h": 4},
+                "targets": [
+                  {
+                    "expr": "sum(kube_pod_status_phase{phase=\"Running\"}) by (namespace)",
+                    "legendFormat": "{{namespace}}"
+                  }
+                ]
+              },
+              {
+                "title": "HTTP Request Rate",
+                "type": "graph",
+                "gridPos": {"x": 6, "y": 0, "w": 12, "h": 8},
+                "targets": [
+                  {
+                    "expr": "sum(rate(apisix_http_requests_total[5m])) by (route)",
+                    "legendFormat": "{{route}}"
+                  }
+                ]
+              },
+              {
+                "title": "Memory Usage by Pod",
+                "type": "graph",
+                "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8},
+                "targets": [
+                  {
+                    "expr": "sum(container_memory_working_set_bytes) by (pod) / 1024 / 1024",
+                    "legendFormat": "{{pod}}"
+                  }
+                ]
+              },
+              {
+                "title": "CPU Usage by Pod",
+                "type": "graph",
+                "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
+                "targets": [
+                  {
+                    "expr": "sum(rate(container_cpu_usage_seconds_total[5m])) by (pod) * 100",
+                    "legendFormat": "{{pod}}"
+                  }
+                ]
+              }
+            ]
+          }
+
+# Alertmanager configuration
+alertmanager:
+  enabled: true
+  alertmanagerSpec:
+    storage:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: local-path
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 2Gi
+
+# Node exporter for host metrics
+nodeExporter:
+  enabled: true
+
+# Kube-state-metrics for cluster state
+kubeStateMetrics:
+  enabled: true
+
+# Disable components not needed for research
+kubeProxy:
+  enabled: false
+
+kubeEtcd:
+  enabled: false
+
+kubeControllerManager:
+  enabled: false
+
+kubeScheduler:
+  enabled: false
+
+# Default rules
+defaultRules:
+  create: true
+  rules:
+    alertmanager: true
+    etcd: false
+    configReloaders: true
+    general: true
+    k8s: true
+    kubeApiserver: false
+    kubeApiserverAvailability: false
+    kubeApiserverSlos: false
+    kubelet: true
+    kubeProxy: false
+    kubePrometheusGeneral: true
+    kubePrometheusNodeRecording: true
+    kubernetesApps: true
+    kubernetesResources: true
+    kubernetesStorage: true
+    kubernetesSystem: true
+    kubeScheduler: false
+    kubeStateMetrics: true
+    network: true
+    node: true
+    nodeExporterAlerting: true
+    nodeExporterRecording: true
+    prometheus: true
+    prometheusOperator: true

@@ -1,0 +1,29 @@
+# FIWARE Deployment - Git Ignore
+
+# Cloned FIWARE repository (downloaded during deployment)
+data-space-connector/
+
+# VM-specific cached IP (each NetLab VM has different IP)
+.last_ip
+
+# PDF documentation (optional, large file)
+*.pdf
+
+# Environment files with secrets
+config/.env
+config/.env.production
+config/.env.development
+
+# Build and test outputs
+tests/load/results/
+*.log
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
