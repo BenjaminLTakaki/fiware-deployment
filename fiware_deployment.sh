@@ -669,12 +669,12 @@ log_ok "local-wildcard secret created in infra."
 log_step "Deploying infrastructure layer..."
 kubectl_apply_with_retry "$FIWARE_DIR/target/k3s/infra/" "infrastructure"
 sleep 30
-wait_for_pods "infra" 300
+wait_for_pods "infra" 60
 
 log_step "Deploying trust anchor..."
 kubectl_apply_with_retry "$FIWARE_DIR/target/k3s/trust-anchor/trust-anchor/" "trust-anchor"
 sleep 20
-wait_for_pods "trust-anchor" 300
+wait_for_pods "trust-anchor" 60
 
 log_step "Deploying provider..."
 kubectl_apply_with_retry "$FIWARE_DIR/target/k3s/dsc-provider/data-space-connector/" "provider"
@@ -768,11 +768,11 @@ echo "================================================================"
 log_step "Giving pods time to start (sleeping 60s)..."
 sleep 60
 
-wait_for_pods "infra" 180
-wait_for_pods "trust-anchor" 180
-wait_for_pods "provider" 420
-wait_for_pods "consumer" 420
-wait_for_pods "mongo-operator" 180
+wait_for_pods "infra" 60
+wait_for_pods "trust-anchor" 60
+wait_for_pods "provider" 60
+wait_for_pods "consumer" 60
+wait_for_pods "mongo-operator" 60
 
 # ======================== PHASE 6.5: LIQUIBASE LOCK CLEANUP ========================
 # Fix 2: Liquibase lock bug (affects 8.3.0 - 8.5.2)
