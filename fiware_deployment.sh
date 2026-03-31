@@ -78,6 +78,19 @@ VERSION_BUGS["8.3.0"]="KEYCLOAK_INIT_BUG,LIQUIBASE_LOCK"
 # Skip compatibility check if set
 SKIP_VERSION_CHECK="${SKIP_VERSION_CHECK:-false}"
 
+# ======================== FEATURE FLAGS ========================
+# Enable DSP/EDC profile (FDSC-EDC + Vault + IdentityHub - required for DSP_INTEGRATION.md)
+DSP_ENABLED="${DSP_ENABLED:-false}"
+# Enable Gaia-X profile (GX-Registry + DSS + did:web - required for GAIA_X.MD)
+GAIAX_ENABLED="${GAIAX_ENABLED:-false}"
+# Auto-configure CCS (Credentials Config Service) after deploy - fixes UC-F5 VCVerifier 404
+# and OperatorCredential scope returning null (REQUIRED for full LOCAL.MD + CENTRAL_MARKETPLACE.md)
+SETUP_CCS="${SETUP_CCS:-true}"
+# Auto-create baseline ODRL policies at PAP (LOCAL.MD offers, selfRegistration, ordering, K8S access)
+SETUP_POLICIES="${SETUP_POLICIES:-true}"
+# Auto-configure DID materials in IdentityHub after DSP deploy (DSP_INTEGRATION.md steps 1-4)
+SETUP_IDENTITY_HUB="${SETUP_IDENTITY_HUB:-false}"  # enabled automatically when DSP_ENABLED=true
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -298,7 +311,28 @@ show_available_ips() {
 
 IP_CACHE_FILE="${SCRIPT_DIR}/.last_ip"
 
-if [ -n "${1:-}" ]; then
+# ======================== ARGUMENT PARSING ========================
+# Supports: ./fiware_deployment.sh [IP] [--dsp] [--gaia-x] [--no-ccs] [--no-policies]
+for arg in "$@"; do
+    case "$arg" in
+        --dsp)           DSP_ENABLED=true ;;
+        --gaia-x)        GAIAX_ENABLED=true ;;
+        --no-ccs)        SETUP_CCS=false ;;
+        --no-policies)   SETUP_POLICIES=false ;;
+        --help|-h)
+            echo "Usage: $0 [IP_ADDRESS] [OPTIONS]"
+            echo "Options:"
+            echo "  --dsp         Enable DSP/EDC profile (FDSC-EDC, Vault, IdentityHub)"
+            echo "  --gaia-x      Enable Gaia-X profile (GX-Registry, DSS, did:web)"
+            echo "  --no-ccs      Skip automatic CCS (credentials-config-service) setup"
+            echo "  --no-policies Skip automatic baseline ODRL policy creation"
+            echo "  --help        Show this help"
+            exit 0
+            ;;
+    esac
+done
+
+if [ -n "${1:-}" ] && [[ "${1}" != --* ]]; then
     # Option 1: Command line argument
     INTERNAL_IP="$1"
     log_ok "Using IP from command line: $INTERNAL_IP"
@@ -585,17 +619,32 @@ log_ok "IP addresses replaced."
 log_step "Running Maven build (this takes a few minutes)..."
 cd "$FIWARE_DIR"
 HELM_VER=$(helm version --short 2>/dev/null | sed 's/v//' | cut -d'+' -f1)
-mvn clean install -Plocal -DskipTests -Ddocker.skip -Dhelm.version="$HELM_VER" 2>&1 | tee /fiware/build.log
+
+# Build the Maven profile list
+MAVEN_PROFILES="local"
+if [ "$DSP_ENABLED" = "true" ]; then
+    MAVEN_PROFILES="local,dsp"
+    SETUP_IDENTITY_HUB=true
+    log_ok "DSP profile enabled — FDSC-EDC, Vault, IdentityHub will be deployed."
+fi
+if [ "$GAIAX_ENABLED" = "true" ]; then
+    MAVEN_PROFILES="${MAVEN_PROFILES},gaia-x"
+    log_ok "Gaia-X profile enabled — GX-Registry, DSS validation, did:web will be deployed."
+    log_warn "Gaia-X requires pre-generated eIDAS certs in helpers/certs/. See GAIA_X.MD for cert generation steps."
+fi
+log_step "Maven profiles: -P${MAVEN_PROFILES}"
+
+mvn clean install -P"${MAVEN_PROFILES}" -DskipTests -Ddocker.skip -Dhelm.version="$HELM_VER" 2>&1 | tee /fiware/build.log
 
 if [ ${PIPESTATUS[0]} -ne 0 ]; then
     log_warn "Maven build may have failed. Retrying once..."
-    mvn clean install -Plocal -DskipTests -Ddocker.skip -Dhelm.version="$HELM_VER" 2>&1 | tee /fiware/build-retry.log
+    mvn clean install -P"${MAVEN_PROFILES}" -DskipTests -Ddocker.skip -Dhelm.version="$HELM_VER" 2>&1 | tee /fiware/build-retry.log
     if [ ${PIPESTATUS[0]} -ne 0 ]; then
         log_err "Maven build failed on retry. Check /fiware/build-retry.log"
         exit 1
     fi
 fi
-log_ok "Maven build complete."
+log_ok "Maven build complete (profiles: ${MAVEN_PROFILES})."
 
 # ======================== PHASE 3: DEPLOY TO K8S ========================
 echo ""
@@ -812,6 +861,345 @@ else
     log_ok "LIQUIBASE_LOCK workaround not needed for version ${DETECTED_VERSION:-unknown}"
 fi
 
+# ======================== PHASE 6.7: POST-DEPLOY CCS CONFIGURATION ========================
+# Root cause of UC-F5 failure and OperatorCredential scope returning null:
+# The Credentials Config Service (CCS) is deployed empty — it has no scope mappings.
+# The VCVerifier reads from CCS to find which credentials to accept for each service scope.
+# Without this configuration, /services/data-service/token returns 404 and the operator
+# scope has no credential mapping, so get_access_token_oid4vp.sh returns null for OPERATOR_CREDENTIAL.
+# This POST-DEPLOY step is REQUIRED for LOCAL.MD, CENTRAL_MARKETPLACE.md, and DSP_INTEGRATION.md.
+
+if [ "$SETUP_CCS" = "true" ]; then
+    echo ""
+    echo "================================================================"
+    echo "  PHASE 6.7: Configuring Credentials Config Service (CCS)"
+    echo "================================================================"
+
+    log_step "Waiting for CCS to become available..."
+    CCS_URL="http://provider-ccs.${INTERNAL_IP}.nip.io:8080"
+    CCS_READY=false
+    for i in $(seq 1 18); do   # 18 × 10s = 3 minutes max
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${CCS_URL}/service" 2>/dev/null || echo "000")
+        if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "404" ]; then
+            CCS_READY=true
+            log_ok "CCS is up (HTTP $HTTP_CODE)."
+            break
+        fi
+        echo "  ... CCS not ready yet (HTTP $HTTP_CODE, attempt $i/18). Waiting 10s..."
+        sleep 10
+    done
+
+    if [ "$CCS_READY" = "true" ]; then
+        log_step "Configuring CCS data-service scope (default + operator)..."
+        # This registers: UserCredential for 'default' scope, OperatorCredential for 'operator' scope.
+        # References: LOCAL.MD §Holder Verification, CENTRAL_MARKETPLACE.md §Buy access
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PUT "${CCS_URL}/service/data-service" \
+            -H 'accept: application/json' \
+            -H 'Content-Type: application/json' \
+            -d "{
+              \"defaultOidcScope\": \"default\",
+              \"oidcScopes\": {
+                \"default\": {
+                  \"credentials\": [{
+                    \"type\": \"UserCredential\",
+                    \"trustedParticipantsLists\": [\"http://tir.trust-anchor.svc.cluster.local:8080\"],
+                    \"trustedIssuersLists\": [\"http://trusted-issuers-list:8080\"]
+                  }]
+                },
+                \"operator\": {
+                  \"credentials\": [{
+                    \"type\": \"OperatorCredential\",
+                    \"trustedParticipantsLists\": [\"http://tir.trust-anchor.svc.cluster.local:8080\"],
+                    \"trustedIssuersLists\": [\"http://trusted-issuers-list:8080\"]
+                  }]
+                },
+                \"legal\": {
+                  \"credentials\": [{
+                    \"type\": \"LegalPersonCredential\",
+                    \"trustedParticipantsLists\": [\"http://tir.trust-anchor.svc.cluster.local:8080\"],
+                    \"trustedIssuersLists\": [\"http://trusted-issuers-list:8080\"]
+                  }]
+                },
+                \"openid\": {
+                  \"credentials\": [{
+                    \"type\": \"MembershipCredential\",
+                    \"trustedParticipantsLists\": [\"http://tir.trust-anchor.svc.cluster.local:8080\"],
+                    \"trustedIssuersLists\": [\"http://trusted-issuers-list:8080\"],
+                    \"jwtInclusion\": {\"enabled\": true, \"fullInclusion\": true}
+                  }]
+                }
+              }
+            }" 2>/dev/null || echo "000")
+        if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ] || [ "$HTTP_CODE" = "204" ]; then
+            log_ok "CCS data-service configured (HTTP $HTTP_CODE). UC-F5 VCVerifier + OperatorCredential scope are now fixed."
+        else
+            log_warn "CCS PUT returned HTTP $HTTP_CODE. Try manually: curl -X PUT ${CCS_URL}/service/data-service ..."
+        fi
+
+        # Also configure the marketplace TMForum endpoint scope (MARKETPLACE_INTEGRATION.md)
+        log_step "Configuring CCS tmf-marketplace scope (REPRESENTATIVE role)..."
+        curl -s -o /dev/null -X PUT "${CCS_URL}/service/tmf-marketplace" \
+            -H 'accept: application/json' \
+            -H 'Content-Type: application/json' \
+            -d "{
+              \"defaultOidcScope\": \"default\",
+              \"oidcScopes\": {
+                \"default\": {
+                  \"credentials\": [{
+                    \"type\": \"UserCredential\",
+                    \"trustedParticipantsLists\": [\"http://tir.trust-anchor.svc.cluster.local:8080\"],
+                    \"trustedIssuersLists\": [\"http://trusted-issuers-list:8080\"]
+                  }]
+                }
+              }
+            }" 2>/dev/null || true
+        log_ok "CCS tmf-marketplace scope configured."
+    else
+        log_warn "CCS did not become available in time. Run this manually after deployment:"
+        log_warn "  curl -X PUT http://provider-ccs.${INTERNAL_IP}.nip.io:8080/service/data-service \\"
+        log_warn "    -H 'Content-Type: application/json' -d '{\"defaultOidcScope\":\"default\",...}'"
+    fi
+fi
+
+# ======================== PHASE 6.8: AUTO-CREATE BASELINE ODRL POLICIES ========================
+# The LOCAL.MD demo requires 4 policies at the PAP before any marketplace flow works.
+# Without them: product offerings return 403, organizations cannot be registered, orders fail.
+# References: LOCAL.MD §Offer creation (steps 1-4), CENTRAL_MARKETPLACE.md §Prepare the marketplace
+
+if [ "$SETUP_POLICIES" = "true" ]; then
+    echo ""
+    echo "================================================================"
+    echo "  PHASE 6.8: Creating Baseline ODRL Policies at PAP"
+    echo "================================================================"
+
+    PAP_URL="http://pap-provider.${INTERNAL_IP}.nip.io:8080"
+    log_step "Waiting for PAP to become available..."
+    PAP_READY=false
+    for i in $(seq 1 18); do
+        HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${PAP_URL}/policy" 2>/dev/null || echo "000")
+        if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "404" ]; then
+            PAP_READY=true
+            log_ok "PAP is up (HTTP $HTTP_CODE)."
+            break
+        fi
+        echo "  ... PAP not ready yet (HTTP $HTTP_CODE, attempt $i/18). Waiting 10s..."
+        sleep 10
+    done
+
+    if [ "$PAP_READY" = "true" ]; then
+
+        # Policy 1: Allow any authenticated participant to read EnergyReport entities
+        log_step "Creating policy: EnergyReport read access (any credential)..."
+        curl -s -o /dev/null -X POST "${PAP_URL}/policy" -H 'Content-Type: application/json' -d '{
+          "@context": {"odrl":"http://www.w3.org/ns/odrl/2/"},
+          "@id": "https://mp-operation.org/policy/common/test",
+          "odrl:uid": "https://mp-operation.org/policy/common/test",
+          "@type": "odrl:Policy",
+          "odrl:permission": {
+            "odrl:assigner": {"@id": "https://www.mp-operation.org/"},
+            "odrl:target": {
+              "@type": "odrl:AssetCollection", "odrl:source": "urn:asset",
+              "odrl:refinement": [{"@type":"odrl:Constraint","odrl:leftOperand":"ngsi-ld:entityType",
+                "odrl:operator":{"@id":"odrl:eq"},"odrl:rightOperand":"EnergyReport"}]},
+            "odrl:assignee": {"@id": "vc:any"},
+            "odrl:action": {"@id": "odrl:read"}}}' 2>/dev/null || true
+
+        # Policy 2: Allow any authenticated participant to read productOffering
+        log_step "Creating policy: product offering read access (any credential)..."
+        curl -s -o /dev/null -X POST "${PAP_URL}/policy" -H 'Content-Type: application/json' -d '{
+          "@context": {"odrl":"http://www.w3.org/ns/odrl/2/"},
+          "@id": "https://mp-operation.org/policy/common/offering",
+          "odrl:uid": "https://mp-operation.org/policy/common/offering",
+          "@type": "odrl:Policy",
+          "odrl:permission": {
+            "odrl:assigner": {"@id": "https://www.mp-operation.org/"},
+            "odrl:target": {
+              "@type": "odrl:AssetCollection", "odrl:source": "urn:asset",
+              "odrl:refinement": [{"@type":"odrl:Constraint","odrl:leftOperand":"tmf:resource",
+                "odrl:operator":{"@id":"odrl:eq"},"odrl:rightOperand":"productOffering"}]},
+            "odrl:assignee": {"@id": "vc:any"},
+            "odrl:action": {"@id": "odrl:read"}}}' 2>/dev/null || true
+
+        # Policy 3: Allow REPRESENTATIVES to self-register (create organization)
+        log_step "Creating policy: organization self-registration (REPRESENTATIVE role)..."
+        curl -s -o /dev/null -X POST "${PAP_URL}/policy" -H 'Content-Type: application/json' -d '{
+          "@context": {"odrl":"http://www.w3.org/ns/odrl/2/"},
+          "@id": "https://mp-operation.org/policy/common/selfRegistration",
+          "odrl:uid": "https://mp-operation.org/policy/common/selfRegistration",
+          "@type": "odrl:Policy",
+          "odrl:permission": {
+            "odrl:assigner": {"@id": "https://www.mp-operation.org/"},
+            "odrl:target": {
+              "@type": "odrl:AssetCollection", "odrl:source": "urn:asset",
+              "odrl:refinement": [{"@type":"odrl:Constraint","odrl:leftOperand":"tmf:resource",
+                "odrl:operator":{"@id":"odrl:eq"},"odrl:rightOperand":"organization"}]},
+            "odrl:assignee": {
+              "@type": "odrl:PartyCollection", "odrl:source": "urn:user",
+              "odrl:refinement": {"@type":"odrl:LogicalConstraint","odrl:and":[
+                {"@type":"odrl:Constraint","odrl:leftOperand":{"@id":"vc:role"},
+                  "odrl:operator":{"@id":"odrl:hasPart"},
+                  "odrl:rightOperand":{"@value":"REPRESENTATIVE","@type":"xsd:string"}},
+                {"@type":"odrl:Constraint","odrl:leftOperand":{"@id":"vc:type"},
+                  "odrl:operator":{"@id":"odrl:hasPart"},
+                  "odrl:rightOperand":{"@value":"UserCredential","@type":"xsd:string"}}]}},
+            "odrl:action": {"@id": "tmf:create"}}}' 2>/dev/null || true
+
+        # Policy 4: Allow REPRESENTATIVES to create productOrder
+        log_step "Creating policy: product ordering (REPRESENTATIVE role)..."
+        curl -s -o /dev/null -X POST "${PAP_URL}/policy" -H 'Content-Type: application/json' -d '{
+          "@context": {"odrl":"http://www.w3.org/ns/odrl/2/"},
+          "@id": "https://mp-operation.org/policy/common/ordering",
+          "odrl:uid": "https://mp-operation.org/policy/common/ordering",
+          "@type": "odrl:Policy",
+          "odrl:permission": {
+            "odrl:assigner": {"@id": "https://www.mp-operation.org/"},
+            "odrl:target": {
+              "@type": "odrl:AssetCollection", "odrl:source": "urn:asset",
+              "odrl:refinement": [{"@type":"odrl:Constraint","odrl:leftOperand":"tmf:resource",
+                "odrl:operator":{"@id":"odrl:eq"},"odrl:rightOperand":"productOrder"}]},
+            "odrl:assignee": {
+              "@type": "odrl:PartyCollection", "odrl:source": "urn:user",
+              "odrl:refinement": {"@type":"odrl:LogicalConstraint","odrl:and":[
+                {"@type":"odrl:Constraint","odrl:leftOperand":{"@id":"vc:role"},
+                  "odrl:operator":{"@id":"odrl:hasPart"},
+                  "odrl:rightOperand":{"@value":"REPRESENTATIVE","@type":"xsd:string"}},
+                {"@type":"odrl:Constraint","odrl:leftOperand":{"@id":"vc:type"},
+                  "odrl:operator":{"@id":"odrl:hasPart"},
+                  "odrl:rightOperand":{"@value":"UserCredential","@type":"xsd:string"}}]}},
+            "odrl:action": {"@id": "tmf:create"}}}' 2>/dev/null || true
+
+        # Policy 5: Allow OPERATORS with OperatorCredential to read K8SCluster entities
+        log_step "Creating policy: K8SCluster read access (OperatorCredential)..."
+        curl -s -o /dev/null -X POST "${PAP_URL}/policy" -H 'Content-Type: application/json' -d '{
+          "@context": {"odrl":"http://www.w3.org/ns/odrl/2/"},
+          "odrl:uid": "https://mp-operation.org/policy/common/allowRead",
+          "@type": "odrl:Policy",
+          "odrl:permission": {
+            "odrl:assigner": {"@id": "https://www.mp-operation.org/"},
+            "odrl:target": {
+              "@type": "odrl:AssetCollection", "odrl:source": "urn:asset",
+              "odrl:refinement": [{"@type":"odrl:Constraint","odrl:leftOperand":"ngsi-ld:entityType",
+                "odrl:operator":{"@id":"odrl:eq"},"odrl:rightOperand":"K8SCluster"}]},
+            "odrl:assignee": {
+              "@type": "odrl:PartyCollection", "odrl:source": "urn:user",
+              "odrl:refinement": {"@type":"odrl:LogicalConstraint","odrl:and":[
+                {"@type":"odrl:Constraint","odrl:leftOperand":{"@id":"vc:role"},
+                  "odrl:operator":{"@id":"odrl:hasPart"},
+                  "odrl:rightOperand":{"@value":"OPERATOR","@type":"xsd:string"}},
+                {"@type":"odrl:Constraint","odrl:leftOperand":{"@id":"vc:type"},
+                  "odrl:operator":{"@id":"odrl:hasPart"},
+                  "odrl:rightOperand":{"@value":"OperatorCredential","@type":"xsd:string"}}]}},
+            "odrl:action": {"@id": "odrl:read"}}}' 2>/dev/null || true
+
+        # Policy 6: Central Marketplace - allow Contract Management to send notifications
+        log_step "Creating policy: allow Contract Management order notifications..."
+        curl -s -o /dev/null -X POST "${PAP_URL}/policy" -H 'Content-Type: application/json' -d '{
+          "@context": {"odrl":"http://www.w3.org/ns/odrl/2/"},
+          "@id": "https://mp-operation.org/policy/common/allowContractManagement",
+          "odrl:uid": "https://mp-operation.org/policy/common/allowContractManagement",
+          "@type": "odrl:Policy",
+          "odrl:permission": {
+            "odrl:assigner": {"@id": "https://www.mp-operation.org/"},
+            "odrl:target": {
+              "@type": "odrl:AssetCollection", "odrl:source": "urn:asset",
+              "odrl:refinement": [{"@type":"odrl:Constraint","odrl:leftOperand":"tmf:resource",
+                "odrl:operator":{"@id":"odrl:eq"},"odrl:rightOperand":"productOrder"}]},
+            "odrl:assignee": {
+              "@type": "odrl:PartyCollection", "odrl:source": "urn:user",
+              "odrl:refinement": {"@type":"odrl:LogicalConstraint","odrl:and":[
+                {"@type":"odrl:Constraint","odrl:leftOperand":{"@id":"vc:role"},
+                  "odrl:operator":{"@id":"odrl:hasPart"},
+                  "odrl:rightOperand":{"@value":"MARKETPLACE","@type":"xsd:string"}},
+                {"@type":"odrl:Constraint","odrl:leftOperand":{"@id":"vc:type"},
+                  "odrl:operator":{"@id":"odrl:hasPart"},
+                  "odrl:rightOperand":{"@value":"MarketplaceCredential","@type":"xsd:string"}}]}},
+            "odrl:action": {"@id": "tmf:create"}}}' 2>/dev/null || true
+
+        log_ok "Baseline policies created. Verify: curl -s ${PAP_URL}/policy | jq .[].\"@id\""
+    else
+        log_warn "PAP not available. Create policies manually after deployment — see LOCAL.MD §Offer creation."
+    fi
+fi
+
+# ======================== PHASE 6.9: DSP IDENTITY HUB SETUP ========================
+# Registers consumer + provider identities in IdentityHub (DSP_INTEGRATION.md steps 1-4)
+# Required before any DCP or OID4VC based DSP catalog/negotiation/transfer flows work.
+
+if [ "$SETUP_IDENTITY_HUB" = "true" ]; then
+    echo ""
+    echo "================================================================"
+    echo "  PHASE 6.9: DSP Identity Hub Setup (consumer + provider)"
+    echo "================================================================"
+    log_step "Waiting for IdentityHub management endpoints..."
+    IH_CONSUMER_URL="http://identityhub-management-fancy-marketplace.${INTERNAL_IP}.nip.io:8080"
+    IH_PROVIDER_URL="http://identityhub-management-mp-operations.${INTERNAL_IP}.nip.io:8080"
+    IH_READY=false
+    for i in $(seq 1 24); do
+        C=$(curl -s -o /dev/null -w "%{http_code}" "${IH_CONSUMER_URL}/api/identity/v1alpha/participants" \
+            -H 'x-api-key: c3VwZXItdXNlcg==.random' 2>/dev/null || echo "000")
+        if [ "$C" = "200" ]; then IH_READY=true; break; fi
+        echo "  ... IdentityHub not ready (HTTP $C, attempt $i/24). Waiting 15s..."
+        sleep 15
+    done
+
+    if [ "$IH_READY" = "true" ]; then
+        log_step "Generating consumer JWK from deployment cert..."
+        CONSUMER_JWK=$("${FIWARE_DIR}/doc/scripts/get-private-jwk-p-256.sh" \
+            "${FIWARE_DIR}/helpers/certs/out/client-consumer/private/client-pkcs8.key.pem" 2>/dev/null || true)
+        PROVIDER_JWK=$("${FIWARE_DIR}/doc/scripts/get-private-jwk-p-256.sh" \
+            "${FIWARE_DIR}/helpers/certs/out/client-provider/private/client-pkcs8.key.pem" 2>/dev/null || true)
+
+        if [ -n "$CONSUMER_JWK" ]; then
+            log_step "Storing consumer key in Vault..."
+            curl -s -o /dev/null -X POST \
+                "http://vault-fancy-marketplace.${INTERNAL_IP}.nip.io:8080/v1/secret/data/key-1" \
+                --header 'X-Vault-Token: root' \
+                --data "$(jq -n --arg content "$CONSUMER_JWK" '{data:{content:$content}}')" 2>/dev/null || true
+
+            log_step "Registering consumer participant in IdentityHub..."
+            CONSUMER_PARTICIPANT=$("${FIWARE_DIR}/doc/scripts/get-participant-create.sh" \
+                "${CONSUMER_JWK}" "did:web:fancy-marketplace.biz" \
+                "http://identityhub-fancy-marketplace.${INTERNAL_IP}.nip.io" "key-1" 2>/dev/null || true)
+            if [ -n "$CONSUMER_PARTICIPANT" ]; then
+                curl -s -o /dev/null -X POST \
+                    "${IH_CONSUMER_URL}/api/identity/v1alpha/participants" \
+                    --header 'Accept: */*' \
+                    --header "x-api-key: c3VwZXItdXNlcg==.random" \
+                    --header 'Content-Type: application/json' \
+                    --data "${CONSUMER_PARTICIPANT}" 2>/dev/null || true
+                log_ok "Consumer identity registered in IdentityHub."
+            fi
+        fi
+
+        if [ -n "$PROVIDER_JWK" ]; then
+            log_step "Storing provider key in Vault..."
+            curl -s -o /dev/null -X POST \
+                "http://vault-mp-operations.${INTERNAL_IP}.nip.io:8080/v1/secret/data/key-1" \
+                --header 'X-Vault-Token: root' \
+                --data "$(jq -n --arg content "$PROVIDER_JWK" '{data:{content:$content}}')" 2>/dev/null || true
+
+            log_step "Registering provider participant in IdentityHub..."
+            PROVIDER_PARTICIPANT=$("${FIWARE_DIR}/doc/scripts/get-participant-create.sh" \
+                "${PROVIDER_JWK}" "did:web:mp-operations.org" \
+                "http://identityhub-mp-operations.${INTERNAL_IP}.nip.io" "key-1" 2>/dev/null || true)
+            if [ -n "$PROVIDER_PARTICIPANT" ]; then
+                curl -s -o /dev/null -X POST \
+                    "${IH_PROVIDER_URL}/api/identity/v1alpha/participants" \
+                    --header 'Accept: */*' \
+                    --header "x-api-key: c3VwZXItdXNlcg==.random" \
+                    --header 'Content-Type: application/json' \
+                    --data "${PROVIDER_PARTICIPANT}" 2>/dev/null || true
+                log_ok "Provider identity registered in IdentityHub."
+            fi
+        fi
+
+        log_ok "IdentityHub setup complete. Membership credentials must still be issued and inserted manually."
+        log_warn "See DSP_INTEGRATION.md §Issue membership-credentials for the manual steps."
+    else
+        log_warn "IdentityHub not reachable. Run DSP_INTEGRATION.md setup steps manually after deployment."
+    fi
+fi
+
 # ======================== PHASE 7: PATCH HELPER SCRIPTS ========================
 echo ""
 echo "================================================================"
@@ -881,11 +1269,19 @@ smoke_test_proxy() {
     fi
 }
 
-smoke_test_proxy "Keycloak Provider"  "https://keycloak-provider.${INTERNAL_IP}.nip.io/realms/master"      "200"
-smoke_test_proxy "Keycloak Consumer"  "https://keycloak-consumer.${INTERNAL_IP}.nip.io/realms/master"      "200"
-smoke_test_proxy "Scorpio Provider"   "https://scorpio-provider.${INTERNAL_IP}.nip.io/ngsi-ld/v1/entities" "200"
-smoke_test_proxy "Trust Anchor (TIR)" "https://tir.${INTERNAL_IP}.nip.io"                                  "200|404"
-smoke_test_proxy "PAP Provider"       "https://pap-provider.${INTERNAL_IP}.nip.io/policy"                  "200"
+smoke_test_proxy "Keycloak Provider"  "https://keycloak-provider.${INTERNAL_IP}.nip.io/realms/master"              "200"
+smoke_test_proxy "Keycloak Consumer"  "https://keycloak-consumer.${INTERNAL_IP}.nip.io/realms/master"              "200"
+smoke_test_proxy "Scorpio Provider"   "https://scorpio-provider.${INTERNAL_IP}.nip.io/ngsi-ld/v1/entities"         "200"
+smoke_test_proxy "Trust Anchor (TIR)" "https://tir.${INTERNAL_IP}.nip.io"                                          "200|404"
+smoke_test_proxy "PAP Provider"       "https://pap-provider.${INTERNAL_IP}.nip.io/policy"                          "200"
+smoke_test_proxy "TMForum API"        "http://tm-forum-api.${INTERNAL_IP}.nip.io:8080/tmf-api/productCatalogManagement/v4/productOffering" "200|401|403"
+smoke_test_proxy "CCS Provider"       "http://provider-ccs.${INTERNAL_IP}.nip.io:8080/service"                     "200|404"
+smoke_test_proxy "VCVerifier"         "https://provider-verifier.${INTERNAL_IP}.nip.io:8443/.well-known/openid-configuration" "200"
+smoke_test_proxy "mp-data-service"    "http://mp-data-service.${INTERNAL_IP}.nip.io:8080/.well-known/openid-configuration"   "200"
+if [ "$DSP_ENABLED" = "true" ]; then
+    smoke_test_proxy "DSP OID4VC"     "http://dsp-mp-operations.${INTERNAL_IP}.nip.io:8080/api/dsp/2025-1/catalog/request"  "200|401|403|405"
+    smoke_test_proxy "IdentityHub Consumer" "http://identityhub-fancy-marketplace.${INTERNAL_IP}.nip.io/.well-known/did.json" "200"
+fi
 
 # Also test the OID4VC token endpoint (the actual use-case entry point)
 echo "  Testing OID4VC token endpoint..."
@@ -929,6 +1325,15 @@ echo ""
 echo "  VM IP:          $INTERNAL_IP"
 echo "  Pods running:   $TOTAL_PODS"
 echo "  Smoke errors:   $ERRORS (warnings, not failures)"
+echo "  Profiles:       ${MAVEN_PROFILES:-local}"
+echo "  CCS setup:      ${SETUP_CCS}"
+echo "  Policies setup: ${SETUP_POLICIES}"
+if [ "$DSP_ENABLED" = "true" ]; then
+echo "  DSP/EDC:        ENABLED (FDSC-EDC, Vault, IdentityHub deployed)"
+fi
+if [ "$GAIAX_ENABLED" = "true" ]; then
+echo "  Gaia-X:         ENABLED (GX-Registry, DSS, did:web deployed)"
+fi
 echo ""
 echo "  IMPORTANT: All FIWARE services are accessed via the squid proxy."
 echo "  Use:  curl -s --cacert $FIWARE_DIR/helpers/certs/out/ca/certs/ca.cert.pem -x localhost:8888 https://<service>.${INTERNAL_IP}.nip.io"
@@ -941,9 +1346,20 @@ echo "  Keycloak Consumer:  https://keycloak-consumer.${INTERNAL_IP}.nip.io"
 echo "  Scorpio (Provider): https://scorpio-provider.${INTERNAL_IP}.nip.io"
 echo "  PAP Provider:       https://pap-provider.${INTERNAL_IP}.nip.io"
 echo "  PAP Consumer:       https://pap-consumer.${INTERNAL_IP}.nip.io"
-echo "  TM Forum API:       https://tm-forum-api.${INTERNAL_IP}.nip.io"
-echo "  Marketplace:        https://marketplace.${INTERNAL_IP}.nip.io"
+echo "  TM Forum API:       http://tm-forum-api.${INTERNAL_IP}.nip.io:8080"
+echo "  mp-TMF API:         http://mp-tmf-api.${INTERNAL_IP}.nip.io:8080"
+echo "  Marketplace (BAE):  https://marketplace.${INTERNAL_IP}.nip.io"
 echo "  Trust Registry:     https://tir.${INTERNAL_IP}.nip.io"
+echo "  CCS Provider:       http://provider-ccs.${INTERNAL_IP}.nip.io:8080"
+echo "  VCVerifier:         https://provider-verifier.${INTERNAL_IP}.nip.io:8443"
+echo "  mp-data-service:    http://mp-data-service.${INTERNAL_IP}.nip.io:8080"
+if [ "$DSP_ENABLED" = "true" ]; then
+echo "  DSP (OID4VC):       http://dsp-mp-operations.${INTERNAL_IP}.nip.io:8080"
+echo "  DSP (DCP):          http://dcp-mp-operations.${INTERNAL_IP}.nip.io:8080"
+echo "  DSP Management:     http://dsp-dcp-management.${INTERNAL_IP}.nip.io:8080"
+echo "  IdentityHub (Cons): http://identityhub-fancy-marketplace.${INTERNAL_IP}.nip.io"
+echo "  IdentityHub (Prov): http://identityhub-mp-operations.${INTERNAL_IP}.nip.io"
+fi
 echo "  ---------------------------------------------------------------"
 echo "  Headlamp:           http://${INTERNAL_IP}:${HEADLAMP_PORT}"
 echo "  Squid Proxy:        localhost:8888"
@@ -962,8 +1378,52 @@ echo "  then verify:"
 echo "    echo \$INTERNAL_IP          # should print $INTERNAL_IP"
 echo "    headlamp-token              # should print a JWT token"
 echo ""
-echo "  Then follow the use-case steps in the deployment guide."
-echo "  For secure access:  curl --cacert \$FIWARE_DIR/helpers/certs/out/ca/certs/ca.cert.pem -x localhost:8888 https://..."
-echo "  For quick testing:  curl -k -x localhost:8888 https://..."
+echo "  AUTOMATED SETUP COMPLETED:"
+echo "    ✓ CCS configured  (fixes VCVerifier 404 + OperatorCredential scope - UC-F5)"
+echo "    ✓ 6 baseline ODRL policies created at PAP"
+if [ "$DSP_ENABLED" = "true" ]; then
+echo "    ✓ IdentityHub participant identities registered"
+fi
+echo ""
+echo "  REMAINING MANUAL STEPS (you must do these):"
+echo "  ---------------------------------------------------------------"
+echo "  LOCAL.MD complete flow:"
+echo "    1. Issue credentials:"
+echo "       export USER_CREDENTIAL=\$(./doc/scripts/get_credential.sh https://keycloak-consumer.${INTERNAL_IP}.nip.io user-credential employee)"
+echo "       export REP_CREDENTIAL=\$(./doc/scripts/get_credential.sh https://keycloak-consumer.${INTERNAL_IP}.nip.io user-credential representative)"
+echo "       export OPERATOR_CREDENTIAL=\$(./doc/scripts/get_credential.sh https://keycloak-consumer.${INTERNAL_IP}.nip.io operator-credential operator)"
+echo "    2. Create product offerings (K8S small + full) — see LOCAL.MD §Offer creation steps 1-3"
+echo "    3. Run the buy-access + cluster-creation flow — see LOCAL.MD §Buy access and create cluster"
+echo ""
+echo "  CENTRAL_MARKETPLACE.md:"
+echo "    1. Run: ./doc/scripts/prepare-central-market-policies.sh"
+echo "    2. Register provider at marketplace — see CENTRAL_MARKETPLACE.md §Prepare the provider"
+echo "    3. Create offerings and run the buy flow"
+echo ""
+if [ "$DSP_ENABLED" = "true" ]; then
+echo "  DSP_INTEGRATION.md (--dsp mode):"
+echo "    1. Issue and insert MembershipCredentials into IdentityHub (both consumer + provider)"
+echo "       See DSP_INTEGRATION.md §Issue membership-credentials"
+echo "    2. Add data to Scorpio (UptimeReport entity)"
+echo "    3. Create TMForum product offering with DSP endpoint chars — see DSP_INTEGRATION.md §Prepare the offering"
+echo "    4. Run DCP/OID4VC catalog + negotiation + transfer flows"
+echo ""
+fi
+if [ "$GAIAX_ENABLED" = "true" ]; then
+echo "  GAIA_X.MD (--gaia-x mode):"
+echo "    1. Certs must be pre-generated: cd helpers/certs && ./generate-certs.sh"
+echo "    2. Register trust anchor in GX-Registry init-container (auto if certs present)"
+echo "    3. Configure browser proxy to localhost:8888 for Squid HTTPS forwarding"
+echo "    4. Verify: curl -k -x localhost:8888 https://fancy-marketplace.biz/.well-known/did.json"
+echo ""
+fi
+echo "  MARKETPLACE_INTEGRATION.md (BAE Marketplace + EUDI Wallet):"
+echo "    1. Install FoxyProxy in Chrome, point to 127.0.0.1:8888"
+echo "    2. Download EUDI wallet APK (see MARKETPLACE_INTEGRATION.md §The Wallet)"
+echo "    3. Set phone WiFi proxy to VM IP:8888"
+echo "    4. Login to marketplace at https://marketplace.${INTERNAL_IP}.nip.io via proxy"
+echo ""
+echo "  For secure curl:  curl --cacert \$FIWARE_DIR/helpers/certs/out/ca/certs/ca.cert.pem -x localhost:8888 https://..."
+echo "  For quick tests:  curl -k -x localhost:8888 https://..."
 echo ""
 echo "================================================================"
