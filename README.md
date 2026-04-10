@@ -49,15 +49,36 @@ chmod +x fiware_deployment.sh
 
 ```
 fiware_deployment/
-├── fiware_deployment.sh    # Main deployment script
+├── fiware_deployment.sh              # Main deployment script
 ├── config/
-│   └── .env.template       # Environment configuration template
+│   └── .env.template                 # Environment configuration template
 ├── docs/
-│   ├── TROUBLESHOOTING.md  # Common issues and solutions
-│   └── VERSION_COMPATIBILITY.md
+│   ├── LOCAL_DEPLOYMENT_2VM_GUIDE.md # Two-VM split deployment guide
+│   ├── single-vm/
+│   │   ├── scenarios/                # Deployment walkthroughs (single VM)
+│   │   │   ├── LOCAL_DEPLOYMENT_SCENARIOS.md
+│   │   │   └── CENTRAL_MARKETPLACE_SCENARIOS.md
+│   │   ├── fixes/                    # Documented fixes for known issues
+│   │   │   ├── MARKETPLACE_LOGGING_FIX.md
+│   │   │   └── MARKETPLACE_REGISTRATION_FIX.md
+│   │   ├── results/                  # Demo execution results and references
+│   │   │   ├── CENTRAL_MARKETPLACE_DEMO_RESULTS.md
+│   │   │   ├── CENTRAL_MARKETPLACE_SESSION_LOG.md
+│   │   │   └── LOCAL_MD_EXECUTION_REFERENCE.md
+│   │   ├── fiware_official_scenarios/ # Use case validation against upstream docs
+│   │   │   └── FIWARE_TEST_SCENARIOS.md
+│   │   ├── analysis/                 # Gap analysis and research findings
+│   │   │   └── DEPLOYMENT_GAP_ANALYSIS.md
+│   │   └── reference/                # Reference material and known issues
+│   │       ├── TROUBLESHOOTING.md
+│   │       └── VERSION_COMPATIBILITY.md
+│   └── two-vm/
+│       ├── scenarios/                # Deployment walkthroughs (two-VM split)
+│       │   └── GAIA_X_SCENARIO_2VM.md
+│       └── fixes/                    # Documented fixes for two-VM issues
 ├── scripts/
-│   ├── healthcheck.sh      # Service health verification
-│   └── deploy-monitoring.sh # Prometheus/Grafana setup
+│   ├── healthcheck.sh                # Service health verification
+│   └── deploy-monitoring.sh          # Prometheus/Grafana setup
 ├── monitoring/
 │   ├── prometheus-values.yaml
 │   └── loki-values.yaml
@@ -122,11 +143,36 @@ Key settings:
 - `FIWARE_COMMIT` - Git commit to deploy
 - `SKIP_VERSION_CHECK` - Bypass version validation
 
+## Documentation
+
+All operational documentation lives under `docs/` and is split by deployment topology.
+
+### Single-VM
+
+| Folder | Contents |
+|--------|----------|
+| `single-vm/scenarios/` | Full deployment and demo walkthroughs |
+| `single-vm/fixes/` | Step-by-step fixes for known issues |
+| `single-vm/results/` | Demo execution results and script references |
+| `single-vm/fiware_official_scenarios/` | Use case validation against upstream FIWARE docs |
+| `single-vm/analysis/` | Deployment gap analysis and research findings |
+| `single-vm/reference/` | Troubleshooting guide and version compatibility |
+
+### Two-VM
+
+| Folder | Contents |
+|--------|----------|
+| `two-vm/scenarios/` | Deployment walkthroughs for the two-VM split setup |
+| `two-vm/fixes/` | Fixes specific to the two-VM topology |
+
+The top-level guide for the two-VM split deployment is at [`docs/LOCAL_DEPLOYMENT_2VM_GUIDE.md`](docs/LOCAL_DEPLOYMENT_2VM_GUIDE.md).
+
 ## Troubleshooting
 
-See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for common issues.
+See [`docs/single-vm/reference/TROUBLESHOOTING.md`](docs/single-vm/reference/TROUBLESHOOTING.md) for common issues.
 
 Quick diagnostics:
+
 ```bash
 # Check pod status
 kubectl get pods -A | grep -v Running
@@ -140,7 +186,7 @@ kubectl logs -n provider <pod-name>
 
 ## Version Compatibility
 
-See [docs/VERSION_COMPATIBILITY.md](docs/VERSION_COMPATIBILITY.md) for supported versions and known issues.
+See [`docs/single-vm/reference/VERSION_COMPATIBILITY.md`](docs/single-vm/reference/VERSION_COMPATIBILITY.md) for supported versions and known issues.
 
 ## License
 

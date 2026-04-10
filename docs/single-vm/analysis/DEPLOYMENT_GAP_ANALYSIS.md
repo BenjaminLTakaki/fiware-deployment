@@ -1,7 +1,7 @@
 # FIWARE Deployment Gap Analysis & Improvement Report
 
-**Date:** 2026-03-31  
-**Script Version:** v5 → v6 (this report)  
+**Date:** 2026-03-31 (updated 2026-04-01)  
+**Script Version:** v5 → v6 → v6.1 (traefik routing fix + clusterCreate policy)  
 **Knowledge Base:** 1,538 docs indexed from FIWARE/data-space-connector, FIWARE/helm-charts, FIWARE/tutorials.NGSI-LD
 
 ---
@@ -21,13 +21,19 @@
 ### Gap: No baseline ODRL policies created post-deploy
 **Root cause:** The script deployed everything but created zero policies. Every TMForum interaction (read offerings, register org, create orders) requires a PAP policy.
 
-**Fix applied (Phase 6.8):** Auto-creates 6 policies on first deploy:
+**Fix applied (Phase 6.8):** Auto-creates 7 policies on first deploy:
 1. EnergyReport read (any credential)
 2. productOffering read (any credential) 
 3. organization create (REPRESENTATIVE role)
 4. productOrder create (REPRESENTATIVE role)
 5. K8SCluster read (OperatorCredential with OPERATOR role)
 6. Contract Management order notifications (MarketplaceCredential)
+7. **clusterCreate** — K8SCluster POST/create (OperatorCredential with OPERATOR role) — **added v6.1**
+
+### Bug: infra Traefik doesn't route did:web domain Ingresses
+**Root cause:** The infra Traefik ConfigMap ships with `providers: kubernetesIngress: {}`, which does not pick up Ingress resources that declare `ingressClassName: traefik`. This caused did:web domain ingresses (mp-operations.org, fancy-marketplace.biz) to be silently ignored, so VCVerifier and TIR lookups fail with connection errors.
+
+**Fix applied (Phase 6.7b):** After CCS setup, the script now patches the `traefik-config` ConfigMap in the `infra` namespace to add `ingressClass: traefik` under `kubernetesIngress`, then restarts the traefik deployment and waits for rollout. **Added v6.1; validated 2026-03-31 on Fontys NetLab VM.**
 
 ### Gap: DSP/EDC profile never activated
 **Root cause:** Script used `mvn clean install -Plocal`. DSP profile (`-Plocal,dsp`) deploys FDSC-EDC, Vault, and IdentityHub (Tractus-X) via `dsp-provider.yaml` + `dsp-consumer.yaml`. Without this, all of `DSP_INTEGRATION.md` is inaccessible.
@@ -48,7 +54,7 @@
 
 | Document | Status Before | Status After Script Fix | Remaining Manual Steps |
 |----------|--------------|------------------------|----------------------|
-| **LOCAL.MD** | ⚠️ UC-F5 broken, no policies | ✅ Fully automated | Issue credentials, create offerings, run buy flow |
+| **LOCAL.MD** | ⚠️ UC-F5 broken, no policies | ✅ Fully automated end-to-end (validated 2026-03-31) — CCS, 7 policies incl. clusterCreate, traefik routing fix | Issue credentials, generate cert via did-helper, create product specs with productSpecCharacteristic, register as customer, place orders |
 | **CENTRAL_MARKETPLACE.md** | ⚠️ OperatorCredential null | ✅ CCS + policies fixed | prepare-central-market-policies.sh, provider registration, offering creation |
 | **CONTRACT_NEGOTIATION.md** | N/A (deprecated) | N/A — Rainbow is deprecated, EDC extension replaces it | None needed |
 | **DSP_INTEGRATION.md** | ❌ Profile never activated | ✅ `--dsp` flag activates | MembershipCredential issuance + IdentityHub insert, Scorpio data, TMForum DSP offering |
@@ -224,10 +230,14 @@ IN CHROME ON YOUR LAPTOP:
 
 ## 5. Known Remaining Issues
 
-| Issue | Impact | Fix |
-|-------|--------|-----|
-| TMForum POST offerings returns 400 | Can't create offerings via API without required reference fields | Always create category + catalog first, then spec, then offering. Follow LOCAL.MD order exactly |
-| BAE Marketplace requires real wallet | Can't test full GUI flow without phone/emulator | Use EUDI APK sideload — instructions in MARKETPLACE_INTEGRATION.md |
-| Gaia-X `did:web` needs HTTPS + valid cert chain | GX-Registry rejects self-signed certs without proper chain | Use helpers/certs scripts to generate proper chain |
-| DSP_INTEGRATION.md MembershipCredential insert | Must be done after IdentityHub is up; Phase 6.9 registers identity but not credentials | Run the manual credential insert steps listed above |
-| Keycloak 26.x realm config format changed (v8.x) | Client scope format changed — some credential types may not issue | See docs/VERSION_COMPATIBILITY.md §KEYCLOAK_26 for updated realm YAML |
+> **LOCAL.MD validated end-to-end on 2026-03-31** on Fontys NetLab VM (192.168.120.128). The full buy-access + K8S cluster creation flow was confirmed working with script v6.1.
+
+| Issue | Impact | Status | Fix |
+|-------|--------|--------|-----|
+| ~~infra Traefik doesn't route `ingressClassName: traefik` ingresses~~ | ~~did:web domains silently dropped; VCVerifier/TIR unreachable~~ | **FIXED v6.1** | Phase 6.7b auto-patches ConfigMap + restarts traefik |
+| ~~Missing clusterCreate policy in Phase 6.8~~ | ~~POST K8SCluster returns 403 even with valid OperatorCredential~~ | **FIXED v6.1** | Phase 6.8 now posts clusterCreate as Policy 7 |
+| TMForum POST offerings returns 400 | Can't create offerings via API without required reference fields | Open | Always create category + catalog first, then spec, then offering. Follow LOCAL.MD order exactly |
+| BAE Marketplace requires real wallet | Can't test full GUI flow without phone/emulator | Open | Use EUDI APK sideload — instructions in MARKETPLACE_INTEGRATION.md |
+| Gaia-X `did:web` needs HTTPS + valid cert chain | GX-Registry rejects self-signed certs without proper chain | Open | Use helpers/certs scripts to generate proper chain |
+| DSP_INTEGRATION.md MembershipCredential insert | Must be done after IdentityHub is up; Phase 6.9 registers identity but not credentials | Open | Run the manual credential insert steps listed above |
+| Keycloak 26.x realm config format changed (v8.x) | Client scope format changed — some credential types may not issue | Open | See docs/VERSION_COMPATIBILITY.md §KEYCLOAK_26 for updated realm YAML |
